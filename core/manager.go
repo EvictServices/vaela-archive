@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -412,10 +413,6 @@ func (m *Manager) distributeShards(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	sort.Slice(instances, func(i, j int) bool {
-		return instances[i].Uptime < instances[j].Uptime
-	})
-
 	var active, stale []*types.InstanceInfo
 	for _, inst := range instances {
 		if _, ok := knownCopy[inst.ID]; ok {
@@ -437,6 +434,7 @@ func (m *Manager) distributeShards(ctx context.Context) error {
 	if len(active) == 0 {
 		return nil
 	}
+	sortInstancesByID(active)
 
 	slog.Info("distributing shards", "instances", len(active))
 	configs := m.distributor.distribute(len(active))
@@ -517,6 +515,7 @@ func (m *Manager) expandDistribution(ctx context.Context) error {
 	if err != nil || len(instances) == 0 {
 		return err
 	}
+	sortInstancesByID(instances)
 
 	m.mu.Lock()
 	var assignedShards []int
@@ -843,6 +842,39 @@ func parseRedis(v interface{}) interface{} {
 		}
 	}
 	return v
+}
+
+func sortInstancesByID(instances []*types.InstanceInfo) {
+	sort.Slice(instances, func(i, j int) bool {
+		aPrefix, aNum, aHasNum := splitTrailingNumber(instances[i].ID)
+		bPrefix, bNum, bHasNum := splitTrailingNumber(instances[j].ID)
+
+		if aPrefix != bPrefix {
+			return aPrefix < bPrefix
+		}
+		if aHasNum && bHasNum && aNum != bNum {
+			return aNum < bNum
+		}
+		if aHasNum != bHasNum {
+			return aHasNum
+		}
+		return instances[i].ID < instances[j].ID
+	})
+}
+
+func splitTrailingNumber(id string) (string, int, bool) {
+	end := len(id) - 1
+	for end >= 0 && id[end] >= '0' && id[end] <= '9' {
+		end--
+	}
+	if end == len(id)-1 {
+		return id, 0, false
+	}
+	n, err := strconv.Atoi(id[end+1:])
+	if err != nil {
+		return id, 0, false
+	}
+	return id[:end+1], n, true
 }
 
 // FindGuild finds a guild by ID, checking cache then the owning shard, then broadcasting.
