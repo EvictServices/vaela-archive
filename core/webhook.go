@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -47,7 +48,8 @@ func (w *webhook) send(ctx context.Context, embed map[string]interface{}) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		slog.Warn("webhook unexpected status", "status", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		slog.Warn("webhook unexpected status", "status", resp.StatusCode, "body", string(body))
 	}
 }
 

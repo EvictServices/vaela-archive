@@ -81,16 +81,16 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	m.ctx, m.cancel = context.WithCancel(ctx)
 
-	if err := m.clearOldInstances(m.ctx); err != nil {
-		slog.Warn("clearOldInstances error", "err", err)
-	}
-
 	m.mu.Lock()
 	m.distributedIDs = make(map[string]struct{})
 	m.shardMap = make(map[int]string)
 	m.knownIDs = make(map[string]struct{})
 	m.shardsDistributed = false
 	m.mu.Unlock()
+
+	if err := m.recoverInstances(m.ctx); err != nil {
+		slog.Warn("recoverInstances error", "err", err)
+	}
 
 	if err := m.pubsub.Start(m.ctx); err != nil {
 		return fmt.Errorf("pubsub start: %w", err)
@@ -128,8 +128,6 @@ func (m *Manager) Stop(ctx context.Context) {
 	slog.Info("Cluster Manager Stopped")
 }
 
-// ---- pub/sub message handlers ----
-
 func (m *Manager) onInstanceReady(msg *types.ClusterMessage) {
 	instanceID, _ := msg.M["instance_id"].(string)
 	if instanceID == "" {
@@ -150,6 +148,7 @@ func (m *Manager) onInstanceReady(msg *types.ClusterMessage) {
 		slog.Error("onInstanceReady unmarshal", "err", err)
 		return
 	}
+	info.ID = instanceID
 
 	ctx := m.ctx
 	if err := m.registry.Register(ctx, instanceID, &info); err != nil {
@@ -207,13 +206,6 @@ func (m *Manager) onHeartbeat(msg *types.ClusterMessage) {
 		return
 	}
 
-	m.mu.Lock()
-	_, known := m.knownIDs[instanceID]
-	m.mu.Unlock()
-	if !known {
-		return
-	}
-
 	ctx := m.ctx
 	if _, hasInfo := msg.M["info"]; hasInfo {
 		raw, err := json.Marshal(msg.M["info"])
@@ -224,25 +216,52 @@ func (m *Manager) onHeartbeat(msg *types.ClusterMessage) {
 		if err := json.Unmarshal(raw, &info); err != nil {
 			return
 		}
-		// Use manager-assigned shards, not instance-reported ones.
+		info.ID = instanceID
+
 		m.mu.Lock()
+		m.knownIDs[instanceID] = struct{}{}
+
 		var assigned []int
 		for sid, iid := range m.shardMap {
 			if iid == instanceID {
 				assigned = append(assigned, sid)
 			}
 		}
+
+		if len(assigned) == 0 && len(info.ShardIDs) > 0 {
+			for _, sid := range info.ShardIDs {
+				owner, exists := m.shardMap[sid]
+				if !exists || owner == instanceID {
+					m.shardMap[sid] = instanceID
+					assigned = append(assigned, sid)
+				}
+			}
+			m.distributedIDs[instanceID] = struct{}{}
+		}
 		m.mu.Unlock()
+
 		sort.Ints(assigned)
-		info.ShardIDs = assigned
-		info.ShardCount = len(assigned)
+		if len(assigned) > 0 {
+			info.ShardIDs = assigned
+		}
+		info.ShardCount = len(info.ShardIDs)
 		_ = m.registry.Register(ctx, instanceID, &info)
 	} else {
+		if inst, err := m.registry.Get(ctx, instanceID); err == nil && inst != nil {
+			m.mu.Lock()
+			m.knownIDs[instanceID] = struct{}{}
+			if len(inst.ShardIDs) > 0 {
+				m.distributedIDs[instanceID] = struct{}{}
+				for _, sid := range inst.ShardIDs {
+					m.shardMap[sid] = instanceID
+				}
+			}
+			m.mu.Unlock()
+		}
 		_ = m.registry.UpdateHeartbeat(ctx, instanceID)
 	}
 }
 
-// ---- startup and shard distribution ----
 
 func (m *Manager) handleStartup(ctx context.Context, instanceID string) {
 	_ = m.pubsub.SendToInstance(ctx, instanceID, "startup_config", map[string]interface{}{
@@ -483,7 +502,6 @@ func (m *Manager) distributeShards(ctx context.Context) error {
 		}
 	}
 
-	// Send empty config to surplus instances.
 	for j := len(configs); j < len(active); j++ {
 		inst := active[j]
 		_ = m.pubsub.SendToInstance(ctx, inst.ID, "shard_config", map[string]interface{}{
@@ -493,7 +511,6 @@ func (m *Manager) distributeShards(ctx context.Context) error {
 		})
 	}
 
-	// Refresh heartbeat timestamps for all distributed instances.
 	now := float64(time.Now().UnixNano()) / 1e9
 	m.mu.Lock()
 	dids := make([]string, 0, len(m.distributedIDs))
@@ -607,7 +624,6 @@ func (m *Manager) expandDistribution(ctx context.Context) error {
 	return nil
 }
 
-// ---- monitor loop ----
 
 func (m *Manager) monitorLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(m.cfg.HeartbeatInterval) * time.Second)
@@ -800,7 +816,6 @@ func (m *Manager) tryRecovery(ctx context.Context, dead []*types.InstanceInfo) {
 	slog.Info("assigned recovery shards", "shards", orphaned, "instance", target.ID)
 }
 
-// ---- routing helpers ----
 
 func (m *Manager) shardForGuild(guildID int64) int {
 	return int((guildID >> 22) % int64(m.cfg.TotalShards))
@@ -825,8 +840,6 @@ func (m *Manager) instanceForShard(ctx context.Context, shardID int) string {
 	m.mu.Unlock()
 	return iid
 }
-
-// ---- data lookup methods ----
 
 func parseRedis(v interface{}) interface{} {
 	switch val := v.(type) {
@@ -877,7 +890,6 @@ func splitTrailingNumber(id string) (string, int, bool) {
 	return id[:end+1], n, true
 }
 
-// FindGuild finds a guild by ID, checking cache then the owning shard, then broadcasting.
 func (m *Manager) FindGuild(ctx context.Context, guildID int64) (map[string]interface{}, error) {
 	cacheKey := fmt.Sprintf("cache:guild:%d", guildID)
 	if cached, _ := m.redis.Get(ctx, cacheKey).Result(); cached != "" {
@@ -929,7 +941,6 @@ func (m *Manager) FindGuild(ctx context.Context, guildID int64) (map[string]inte
 	return map[string]interface{}{"guild_id": fmt.Sprintf("%d", guildID), "error": "not_found"}, nil
 }
 
-// FindUser finds a user by ID, checking cache first then broadcasting.
 func (m *Manager) FindUser(ctx context.Context, userID int64) (map[string]interface{}, error) {
 	cacheKey := fmt.Sprintf("cache:user:%d", userID)
 	if cached, _ := m.redis.Get(ctx, cacheKey).Result(); cached != "" {
@@ -964,7 +975,6 @@ func (m *Manager) FindUser(ctx context.Context, userID int64) (map[string]interf
 	return nil, nil
 }
 
-// FindUsers finds multiple users, using cached results where available.
 func (m *Manager) FindUsers(ctx context.Context, userIDs []int64) (map[int64]map[string]interface{}, error) {
 	results := make(map[int64]map[string]interface{})
 	if len(userIDs) == 0 {
@@ -1036,7 +1046,6 @@ func (m *Manager) FindUsers(ctx context.Context, userIDs []int64) (map[int64]map
 	return results, nil
 }
 
-// FindMutualGuilds returns all guilds a user shares with the bot.
 func (m *Manager) FindMutualGuilds(ctx context.Context, userID int64) ([]map[string]interface{}, error) {
 	cacheKey := fmt.Sprintf("cache:mutuals:%d", userID)
 	if cached, _ := m.redis.Get(ctx, cacheKey).Result(); cached != "" {
@@ -1085,7 +1094,6 @@ func (m *Manager) FindMutualGuilds(ctx context.Context, userID int64) ([]map[str
 	return mutuals, nil
 }
 
-// FindGuildChannels returns all channels for a guild.
 func (m *Manager) FindGuildChannels(ctx context.Context, guildID int64) ([]map[string]interface{}, error) {
 	cacheKey := fmt.Sprintf("cache:channels:%d", guildID)
 	if cached, _ := m.redis.Get(ctx, cacheKey).Result(); cached != "" {
@@ -1139,7 +1147,6 @@ func (m *Manager) FindGuildChannels(ctx context.Context, guildID int64) ([]map[s
 	return nil, nil
 }
 
-// FindGuildChannel returns a specific channel within a guild.
 func (m *Manager) FindGuildChannel(ctx context.Context, guildID, channelID int64) (map[string]interface{}, error) {
 	cacheKey := fmt.Sprintf("cache:channel:%d:%d", guildID, channelID)
 	if cached, _ := m.redis.Get(ctx, cacheKey).Result(); cached != "" {
@@ -1197,7 +1204,6 @@ func (m *Manager) FindGuildChannel(ctx context.Context, guildID, channelID int64
 	}, nil
 }
 
-// ListCommands requests the command list from the first available instance.
 func (m *Manager) ListCommands(ctx context.Context) ([]map[string]interface{}, error) {
 	instances, _ := m.registry.ListAll(ctx)
 	if len(instances) == 0 {
@@ -1227,7 +1233,6 @@ func (m *Manager) ListCommands(ctx context.Context) ([]map[string]interface{}, e
 	return nil, nil
 }
 
-// State returns a snapshot of the current cluster state.
 func (m *Manager) State(ctx context.Context) (*types.ClusterState, error) {
 	instances, err := m.registry.ListAll(ctx)
 	if err != nil {
@@ -1245,12 +1250,10 @@ func (m *Manager) State(ctx context.Context) (*types.ClusterState, error) {
 	return state, nil
 }
 
-// BroadcastGlobalEvent sends an event to all instances.
 func (m *Manager) BroadcastGlobalEvent(ctx context.Context, event string, data map[string]interface{}) error {
 	return m.pubsub.BroadcastGlobalEvent(ctx, event, data)
 }
 
-// RequestGuildUpdate asks one or all instances to resend their guild data.
 func (m *Manager) RequestGuildUpdate(ctx context.Context, instanceID string) error {
 	if instanceID != "" {
 		return m.pubsub.SendToInstance(ctx, instanceID, "request_guild_data", map[string]interface{}{})
@@ -1258,7 +1261,6 @@ func (m *Manager) RequestGuildUpdate(ctx context.Context, instanceID string) err
 	return m.pubsub.Broadcast(ctx, "request_guild_data", map[string]interface{}{})
 }
 
-// AllGuilds aggregates guild data stored by all instances.
 func (m *Manager) AllGuilds(ctx context.Context) ([]map[string]interface{}, error) {
 	instances, err := m.registry.ListAll(ctx)
 	if err != nil {
@@ -1272,7 +1274,6 @@ func (m *Manager) AllGuilds(ctx context.Context) ([]map[string]interface{}, erro
 	return guilds, nil
 }
 
-// GuildStats returns aggregated guild and user counts.
 func (m *Manager) GuildStats(ctx context.Context) (map[string]interface{}, error) {
 	instances, err := m.registry.ListAll(ctx)
 	if err != nil {
@@ -1296,24 +1297,63 @@ func (m *Manager) GuildStats(ctx context.Context) (map[string]interface{}, error
 	}, nil
 }
 
-func (m *Manager) clearOldInstances(ctx context.Context) error {
+func (m *Manager) recoverInstances(ctx context.Context) error {
 	instances, err := m.registry.ListAll(ctx)
 	if err != nil {
 		return err
 	}
+	if len(instances) == 0 {
+		return nil
+	}
+
+	now := float64(time.Now().UnixNano()) / 1e9
+	freshWindow := float64(m.cfg.HeartbeatTimeout)
+	if freshWindow < 120 {
+		freshWindow = 120
+	}
+
+	var staleIDs []string
+	active := make([]*types.InstanceInfo, 0, len(instances))
 	for _, inst := range instances {
-		_ = m.registry.Unregister(ctx, inst.ID)
+		if inst == nil {
+			continue
+		}
+		if now-inst.LastHeartbeat > freshWindow {
+			staleIDs = append(staleIDs, inst.ID)
+			continue
+		}
+		active = append(active, inst)
 	}
-	if len(instances) > 0 {
-		slog.Info("cleared stale instances", "count", len(instances))
+
+	for _, id := range staleIDs {
+		_ = m.registry.Unregister(ctx, id)
 	}
+
+	recoveredShards := make(map[int]struct{})
+	m.mu.Lock()
+	for _, inst := range active {
+		m.knownIDs[inst.ID] = struct{}{}
+		if len(inst.ShardIDs) > 0 {
+			m.distributedIDs[inst.ID] = struct{}{}
+			for _, sid := range inst.ShardIDs {
+				m.shardMap[sid] = inst.ID
+				recoveredShards[sid] = struct{}{}
+			}
+		}
+	}
+	m.shardsDistributed = len(recoveredShards) >= m.cfg.TotalShards
+	m.mu.Unlock()
+
+	slog.Info("recovered instances from registry",
+		"instances", len(active),
+		"stale_removed", len(staleIDs),
+		"active_shards", len(recoveredShards),
+	)
 	return nil
 }
 
-// Config exposes the cluster configuration (used by API handlers).
 func (m *Manager) Config() *config.Config { return m.cfg }
 
-// ---- small helpers ----
 
 func toInt64(v interface{}) int64 {
 	switch val := v.(type) {

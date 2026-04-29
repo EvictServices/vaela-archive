@@ -33,6 +33,7 @@ func newRegistry(rdb *redis.Client) *registry {
 }
 
 func (r *registry) Register(ctx context.Context, instanceID string, info *types.InstanceInfo) error {
+	info.ID = instanceID
 	key := "cluster:instances:" + instanceID
 	data, err := json.Marshal(info)
 	if err != nil {
@@ -85,6 +86,7 @@ func (r *registry) Get(ctx context.Context, instanceID string) (*types.InstanceI
 	if err := json.Unmarshal(data, &info); err != nil {
 		return nil, err
 	}
+	info.ID = instanceID
 	r.mu.Lock()
 	r.cache[instanceID] = instanceEntry{info: &info, ts: time.Now()}
 	r.mu.Unlock()
@@ -126,6 +128,7 @@ func (r *registry) ListAll(ctx context.Context) ([]*types.InstanceInfo, error) {
 		if err := json.Unmarshal([]byte(raw), &info); err != nil {
 			continue
 		}
+		info.ID = rawIDs[i]
 		r.cache[rawIDs[i]] = instanceEntry{info: &info, ts: now}
 		instances = append(instances, &info)
 	}

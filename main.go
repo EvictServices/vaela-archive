@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"cluster/session"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -82,10 +84,25 @@ type ClusterService struct {
 }
 
 func newClusterService() *ClusterService {
+	loadDotEnv()
+
 	return &ClusterService{
 		cfg:     config.Load(),
 		session: session.New("/tmp/elara/cluster"),
 	}
+}
+
+func loadDotEnv() {
+	paths := []string{".env"}
+	if exePath, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exePath), ".env"))
+	}
+
+	if err := godotenv.Load(paths...); err != nil {
+		slog.Warn(".env not loaded", "paths", paths, "err", err)
+		return
+	}
+	slog.Info("environment loaded", "paths", paths)
 }
 
 func (s *ClusterService) run(ctx context.Context) error {
