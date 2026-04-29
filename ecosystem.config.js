@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "cluster",
+      name: "vaela",
       script: "./cluster",
       interpreter: "none",
       autorestart: true,

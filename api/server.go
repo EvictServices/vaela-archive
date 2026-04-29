@@ -14,17 +14,15 @@ import (
 	"cluster/types"
 
 	"github.com/shirou/gopsutil/v3/cpu"
-	gopsnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/mem"
+	gopsnet "github.com/shirou/gopsutil/v3/net"
 )
 
-// Server is the HTTP handler for the cluster management API.
 type Server struct {
 	manager *core.Manager
 	mux     *http.ServeMux
 }
 
-// NewServer wires all routes and returns the Server.
 func NewServer(m *core.Manager) *Server {
 	s := &Server{manager: m, mux: http.NewServeMux()}
 	s.routes()
@@ -32,7 +30,7 @@ func NewServer(m *core.Manager) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	cors(s.mux).ServeHTTP(w, r)
+	accessLog(cors(s.mux)).ServeHTTP(w, r)
 }
 
 func (s *Server) routes() {
@@ -51,8 +49,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /guild/{guild_id}/channels/{channel_id}", internalOnly(s.getGuildChannel))
 }
 
-// ---- middleware ----
-
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -63,6 +59,38 @@ func cors(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+		next.ServeHTTP(rec, req)
+
+		host, _, err := net.SplitHostPort(req.RemoteAddr)
+		if err != nil {
+			host = req.RemoteAddr
+		}
+
+		slog.Info("HTTP Request",
+			"method", req.Method,
+			"path", req.URL.Path,
+			"status", rec.status,
+			"latency", time.Since(start).Round(time.Millisecond).String(),
+			"remote", host,
+		)
 	})
 }
 
@@ -79,8 +107,6 @@ func internalOnly(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
-
-// ---- helpers ----
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -151,8 +177,6 @@ func systemMetrics() map[string]interface{} {
 		"network": netMetrics,
 	}
 }
-
-// ---- route handlers ----
 
 func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -444,8 +468,6 @@ func (s *Server) getGuildChannel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// ---- small helpers ----
-
 func minShardID(ids []int) int {
 	if len(ids) == 0 {
 		return math.MaxInt
@@ -473,5 +495,3 @@ func toInt64(v interface{}) int64 {
 	}
 	return 0
 }
-
-

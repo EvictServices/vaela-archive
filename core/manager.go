@@ -65,7 +65,7 @@ func NewManager(rdb *redis.Client, sess SessionProvider, cfg *config.Config) *Ma
 	}
 }
 
-func (m *Manager) Registry() *registry { return m.registry }
+func (m *Manager) Registry() *registry          { return m.registry }
 func (m *Manager) Events() *events.EventEmitter { return m.events }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -104,7 +104,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.monitorLoop(m.ctx)
 	}()
 
-	slog.Info("Cluster manager started")
+	slog.Info("Cluster Manager Started")
 	_ = m.pubsub.Broadcast(m.ctx, "cluster_restart", map[string]interface{}{})
 	go m.webhook.ClusterStarted(m.ctx, m.cfg.TotalShards, m.cfg.ExpectedInstances)
 	return nil
@@ -1257,10 +1257,10 @@ func (m *Manager) GuildStats(ctx context.Context) (map[string]interface{}, error
 		}
 	}
 	return map[string]interface{}{
-		"total_guilds":  totalGuilds,
-		"total_users":   totalUsers,
-		"instances":     len(instances),
-		"distribution":  distribution,
+		"total_guilds": totalGuilds,
+		"total_users":  totalUsers,
+		"instances":    len(instances),
+		"distribution": distribution,
 	}, nil
 }
 
