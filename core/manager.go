@@ -1205,31 +1205,60 @@ func (m *Manager) FindGuildChannel(ctx context.Context, guildID, channelID int64
 }
 
 func (m *Manager) ListCommands(ctx context.Context) ([]map[string]interface{}, error) {
-	instances, _ := m.registry.ListAll(ctx)
+	instances, err := m.registry.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if len(instances) == 0 {
 		return nil, nil
 	}
 
-	instanceID := instances[0].ID
-	responseKey := fmt.Sprintf("cluster:commands_response:%s", instanceID)
-	_ = m.redis.Del(ctx, responseKey)
-	_ = m.pubsub.SendToInstance(ctx, instanceID, "request_commands", map[string]interface{}{})
+	now := float64(time.Now().UnixNano()) / 1e9
+	timeout := float64(m.cfg.HeartbeatTimeout)
+	alive := instances[:0]
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if now-inst.LastHeartbeat <= timeout {
+			alive = append(alive, inst)
+		}
+	}
+	if len(alive) == 0 {
+		alive = instances
+	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		val, err := m.redis.Get(ctx, responseKey).Result()
-		if err == nil {
-			_ = m.redis.Del(ctx, responseKey)
-			if d, ok := parseRedis(val).([]interface{}); ok {
+	sort.Slice(alive, func(i, j int) bool {
+		return alive[i].LastHeartbeat > alive[j].LastHeartbeat
+	})
+
+	const maxAttempts = 3
+	attempts := len(alive)
+	if attempts > maxAttempts {
+		attempts = maxAttempts
+	}
+
+	for i := 0; i < attempts; i++ {
+		instanceID := alive[i].ID
+		responseKey := fmt.Sprintf("cluster:commands_response:%s", instanceID)
+		_ = m.redis.Del(ctx, responseKey)
+		_ = m.pubsub.SendToInstance(ctx, instanceID, "request_commands", map[string]interface{}{})
+
+		result, err := m.redis.BLPop(ctx, 1200*time.Millisecond, responseKey).Result()
+		_ = m.redis.Del(ctx, responseKey)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if len(result) > 1 {
+			if d, ok := parseRedis(result[1]).([]interface{}); ok {
 				return toMapSlice(d), nil
 			}
 		}
-		select {
-		case <-time.After(100 * time.Millisecond):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
 	}
+
 	return nil, nil
 }
 

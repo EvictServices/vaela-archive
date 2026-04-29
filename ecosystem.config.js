@@ -16,7 +16,7 @@ module.exports = {
         CLUSTER_HEARTBEAT_INTERVAL: "30",
         CLUSTER_MANAGER_HOST: "localhost",
         CLUSTER_MANAGER_PORT: "8000",
-        CLUSTER_WEBHOOK_URL: "",
+        CLUSTER_WEBHOOK_URL: "https://discord.com/api/webhooks/1489832888605347871/qb1r3Xf2WIIuU-rTqDUUxhfPS6a1u5d4d--n0uQqCa7URM93j_pzBlg9impOcNoWlNxK",
       },
     },
   ],
