@@ -32,5 +32,5 @@ vendor/
 .idea/
 
 # Go module files
-.mod
-.sum
+go.mod
+go.sum
