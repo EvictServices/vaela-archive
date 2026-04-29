@@ -30,3 +30,7 @@ vendor/
 # Editor and tooling
 .vscode/
 .idea/
+
+# Go module files
+.mod
+.sum
