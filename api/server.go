@@ -197,6 +197,8 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 	clusters := make(map[string]interface{}, len(instances))
 
 	for _, inst := range instances {
+		restartCount, reconnectCount := s.manager.InstanceReconnectStats(inst.ID)
+
 		var avgLatency float64
 		if len(inst.Shards) > 0 {
 			sum := 0.0
@@ -215,12 +217,14 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 		shards := make([]map[string]interface{}, len(inst.Shards))
 		for i, sh := range inst.Shards {
 			shards[i] = map[string]interface{}{
-				"id":      sh.ID,
-				"latency": sh.Latency,
-				"users":   sh.Users,
-				"guilds":  sh.Guilds,
-				"uptime":  sh.Uptime,
-				"seen":    sh.Seen,
+				"id":              sh.ID,
+				"latency":         sh.Latency,
+				"users":           sh.Users,
+				"guilds":          sh.Guilds,
+				"uptime":          sh.Uptime,
+				"seen":            sh.Seen,
+				"restart_count":   restartCount,
+				"reconnect_count": reconnectCount,
 			}
 		}
 
@@ -237,6 +241,8 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 			"users":           inst.Users,
 			"guilds":          inst.Guilds,
 			"average_latency": avgLatency,
+			"restart_count":   restartCount,
+			"reconnect_count": reconnectCount,
 			"shards":          shards,
 		}
 	}

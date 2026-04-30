@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,8 @@ type Manager struct {
 	shardsDistributed     bool
 	distributedIDs        map[string]struct{}
 	knownIDs              map[string]struct{}
+	restartCounts         map[string]int
+	reconnectCounts       map[string]int
 	shardMap              map[int]string
 	distributing          bool
 	pendingRedistribution bool
@@ -62,6 +65,8 @@ func NewManager(rdb *redis.Client, sess SessionProvider, cfg *config.Config) *Ma
 		webhook:        newWebhook(),
 		distributedIDs: make(map[string]struct{}),
 		knownIDs:       make(map[string]struct{}),
+		restartCounts:  make(map[string]int),
+		reconnectCounts: make(map[string]int),
 		shardMap:       make(map[int]string),
 	}
 }
@@ -85,6 +90,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.distributedIDs = make(map[string]struct{})
 	m.shardMap = make(map[int]string)
 	m.knownIDs = make(map[string]struct{})
+	m.restartCounts = make(map[string]int)
+	m.reconnectCounts = make(map[string]int)
 	m.shardsDistributed = false
 	m.mu.Unlock()
 
@@ -162,10 +169,17 @@ func (m *Manager) onInstanceReady(msg *types.ClusterMessage) {
 
 	switch info.Status {
 	case "connecting":
+		m.mu.Lock()
+		m.restartCounts[instanceID]++
+		m.clearInstanceAssignmentLocked(instanceID)
+		m.mu.Unlock()
 		m.handleStartup(ctx, instanceID)
 		go m.webhook.InstanceConnected(ctx, instanceID, nil, "connecting")
 
 	case "ready":
+		m.mu.Lock()
+		m.reconnectCounts[instanceID]++
+		m.mu.Unlock()
 		if len(info.ShardIDs) > 0 {
 			m.mu.Lock()
 			var conflicts []int
@@ -206,6 +220,13 @@ func (m *Manager) onHeartbeat(msg *types.ClusterMessage) {
 		return
 	}
 
+	m.mu.Lock()
+	_, wasKnown := m.knownIDs[instanceID]
+	if !wasKnown {
+		m.knownIDs[instanceID] = struct{}{}
+	}
+	m.mu.Unlock()
+
 	ctx := m.ctx
 	if _, hasInfo := msg.M["info"]; hasInfo {
 		raw, err := json.Marshal(msg.M["info"])
@@ -217,10 +238,13 @@ func (m *Manager) onHeartbeat(msg *types.ClusterMessage) {
 			return
 		}
 		info.ID = instanceID
+		if info.Status == "connecting" {
+			m.mu.Lock()
+			m.clearInstanceAssignmentLocked(instanceID)
+			m.mu.Unlock()
+		}
 
 		m.mu.Lock()
-		m.knownIDs[instanceID] = struct{}{}
-
 		var assigned []int
 		for sid, iid := range m.shardMap {
 			if iid == instanceID {
@@ -246,10 +270,13 @@ func (m *Manager) onHeartbeat(msg *types.ClusterMessage) {
 		}
 		info.ShardCount = len(info.ShardIDs)
 		_ = m.registry.Register(ctx, instanceID, &info)
+
+		if !wasKnown || info.Status == "connecting" {
+			m.handleStartup(ctx, instanceID)
+		}
 	} else {
 		if inst, err := m.registry.Get(ctx, instanceID); err == nil && inst != nil {
 			m.mu.Lock()
-			m.knownIDs[instanceID] = struct{}{}
 			if len(inst.ShardIDs) > 0 {
 				m.distributedIDs[instanceID] = struct{}{}
 				for _, sid := range inst.ShardIDs {
@@ -257,6 +284,18 @@ func (m *Manager) onHeartbeat(msg *types.ClusterMessage) {
 				}
 			}
 			m.mu.Unlock()
+
+			if !wasKnown {
+				m.handleStartup(ctx, instanceID)
+			}
+		} else if !wasKnown {
+			stub := &types.InstanceInfo{
+				ID:            instanceID,
+				Status:        "connecting",
+				LastHeartbeat: float64(time.Now().UnixNano()) / 1e9,
+			}
+			_ = m.registry.Register(ctx, instanceID, stub)
+			m.handleStartup(ctx, instanceID)
 		}
 		_ = m.registry.UpdateHeartbeat(ctx, instanceID)
 	}
@@ -291,7 +330,6 @@ func (m *Manager) handleStartup(ctx context.Context, instanceID string) {
 	}
 
 	shardsDistributed := m.shardsDistributed
-	totalShardsLen := len(m.shardMap)
 	m.mu.Unlock()
 
 	if connectingCount >= m.cfg.ExpectedInstances {
@@ -312,21 +350,22 @@ func (m *Manager) handleStartup(ctx context.Context, instanceID string) {
 	}
 
 	if shardsDistributed {
-		if totalShardsLen >= m.cfg.TotalShards {
-			slog.Info("instance arrived after distribution; all shards covered, sending empty config", "instance", instanceID)
-			_ = m.pubsub.SendToInstance(ctx, instanceID, "shard_config", map[string]interface{}{
-				"shard_ids":   []int{},
-				"shard_count": m.cfg.TotalShards,
-				"instance_id": instanceID,
-			})
-		} else {
-			slog.Info("instance arrived after distribution; expanding to cover unassigned shards", "instance", instanceID)
-			m.wg.Add(1)
-			go func() {
-				defer m.wg.Done()
-				m.runExpandDistribution(ctx)
-			}()
+		m.mu.Lock()
+		if m.distributing {
+			m.pendingRedistribution = true
+			m.mu.Unlock()
+			slog.Info("instance arrived while redistributing; queued rebalance", "instance", instanceID)
+			return
 		}
+		m.shardsDistributed = false
+		m.mu.Unlock()
+
+		slog.Info("instance arrived after distribution; triggering full rebalance", "instance", instanceID)
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.runDistribution(ctx)
+		}()
 		return
 	}
 
@@ -492,7 +531,7 @@ func (m *Manager) distributeShards(ctx context.Context) error {
 		slog.Info("distributed shards", "shards", cfg.ShardIDs, "instance", inst.ID)
 
 		if i < len(configs)-1 {
-			delay := time.Duration(len(cfg.ShardIDs)*6) * time.Second
+			delay := 2 * time.Second
 			slog.Info("waiting before next instance", "delay", delay)
 			select {
 			case <-time.After(delay):
@@ -613,7 +652,7 @@ func (m *Manager) expandDistribution(ctx context.Context) error {
 		slog.Info("expanded distribution", "shards", chunk, "instance", inst.ID)
 
 		if i < len(unassigned)-1 {
-			delay := time.Duration(len(chunk)*6) * time.Second
+			delay := 2 * time.Second
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -1238,25 +1277,74 @@ func (m *Manager) ListCommands(ctx context.Context) ([]map[string]interface{}, e
 		attempts = maxAttempts
 	}
 
+	keys := make([]string, 0, attempts)
 	for i := 0; i < attempts; i++ {
 		instanceID := alive[i].ID
 		responseKey := fmt.Sprintf("cluster:commands_response:%s", instanceID)
+		keys = append(keys, responseKey)
 		_ = m.redis.Del(ctx, responseKey)
 		_ = m.pubsub.SendToInstance(ctx, instanceID, "request_commands", map[string]interface{}{})
+	}
+	parseCommands := func(raw string) ([]map[string]interface{}, bool) {
+		parsed := parseRedis(raw)
+		if d, ok := parsed.([]interface{}); ok {
+			return toMapSlice(d), true
+		}
+		if d, ok := parsed.(map[string]interface{}); ok {
+			if payload, ok := d["data"].(map[string]interface{}); ok {
+				if rawCmds, ok := payload["commands"].(map[string]interface{}); ok {
+					categories := make([]string, 0, len(rawCmds))
+					for name := range rawCmds {
+						categories = append(categories, name)
+					}
+					sort.Strings(categories)
 
-		result, err := m.redis.BLPop(ctx, 1200*time.Millisecond, responseKey).Result()
-		_ = m.redis.Del(ctx, responseKey)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+					out := make([]map[string]interface{}, 0, len(categories))
+					for _, name := range categories {
+						entry := map[string]interface{}{"category": name}
+						switch cmds := rawCmds[name].(type) {
+						case []interface{}:
+							entry["commands"] = toMapSlice(cmds)
+						default:
+							entry["commands"] = []map[string]interface{}{}
+						}
+						out = append(out, entry)
+					}
+					return out, true
+				}
 			}
-			continue
 		}
-		if len(result) > 1 {
-			if d, ok := parseRedis(result[1]).([]interface{}); ok {
-				return toMapSlice(d), nil
+		return nil, false
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, key := range keys {
+			val, err := m.redis.Get(ctx, key).Result()
+			if err == nil {
+				_ = m.redis.Del(ctx, key)
+				if out, ok := parseCommands(val); ok {
+					for _, k := range keys {
+						if k != key {
+							_ = m.redis.Del(ctx, k)
+						}
+					}
+					return out, nil
+				}
 			}
 		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			for _, key := range keys {
+				_ = m.redis.Del(ctx, key)
+			}
+			return nil, ctx.Err()
+		}
+	}
+
+	for _, key := range keys {
+		_ = m.redis.Del(ctx, key)
 	}
 
 	return nil, nil
@@ -1298,6 +1386,9 @@ func (m *Manager) AllGuilds(ctx context.Context) ([]map[string]interface{}, erro
 	var guilds []map[string]interface{}
 	for _, inst := range instances {
 		data, _ := m.registry.GetGuildData(ctx, inst.ID)
+		for _, g := range data {
+			ensureGuildIconURL(g)
+		}
 		guilds = append(guilds, data...)
 	}
 	return guilds, nil
@@ -1383,6 +1474,14 @@ func (m *Manager) recoverInstances(ctx context.Context) error {
 
 func (m *Manager) Config() *config.Config { return m.cfg }
 
+func (m *Manager) InstanceReconnectStats(instanceID string) (int, int) {
+	m.mu.Lock()
+	restarts := m.restartCounts[instanceID]
+	reconnects := m.reconnectCounts[instanceID]
+	m.mu.Unlock()
+	return restarts, reconnects
+}
+
 
 func toInt64(v interface{}) int64 {
 	switch val := v.(type) {
@@ -1404,4 +1503,52 @@ func toMapSlice(in []interface{}) []map[string]interface{} {
 		}
 	}
 	return out
+}
+
+func (m *Manager) clearInstanceAssignmentLocked(instanceID string) {
+	delete(m.distributedIDs, instanceID)
+	for sid, owner := range m.shardMap {
+		if owner == instanceID {
+			delete(m.shardMap, sid)
+		}
+	}
+}
+
+func ensureGuildIconURL(guild map[string]interface{}) {
+	if guild == nil {
+		return
+	}
+	if iconURL, ok := guild["icon_url"].(string); ok && iconURL != "" {
+		return
+	}
+
+	var guildID string
+	switch v := guild["id"].(type) {
+	case string:
+		guildID = v
+	case float64:
+		guildID = strconv.FormatInt(int64(v), 10)
+	case int64:
+		guildID = strconv.FormatInt(v, 10)
+	case int:
+		guildID = strconv.Itoa(v)
+	}
+
+	var icon string
+	if v, ok := guild["icon"].(string); ok {
+		icon = v
+	} else if v, ok := guild["icon_hash"].(string); ok {
+		icon = v
+	}
+
+	if guildID == "" || icon == "" {
+		guild["icon_url"] = ""
+		return
+	}
+
+	ext := "png"
+	if strings.HasPrefix(icon, "a_") {
+		ext = "gif"
+	}
+	guild["icon_url"] = fmt.Sprintf("https://cdn.discordapp.com/icons/%s/%s.%s?size=1024", guildID, icon, ext)
 }
