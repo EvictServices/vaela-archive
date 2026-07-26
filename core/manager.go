@@ -452,10 +452,7 @@ func (m *Manager) distributeShards(ctx context.Context) error {
 
 		if pending {
 			slog.Info("processing pending redistribution for late-arriving instances")
-			_ = m.expandDistribution(ctx)
-			m.mu.Lock()
-			m.shardsDistributed = true
-			m.mu.Unlock()
+			m.runDistribution(ctx)
 		}
 	}()
 
@@ -607,7 +604,7 @@ func (m *Manager) expandDistribution(ctx context.Context) error {
 		}
 	}
 	if len(remaining) == 0 {
-		slog.Info("no unassigned shards to distribute")
+		slog.Info("no unassigned shards to distribute to late-arriving instances")
 		for _, inst := range unassigned {
 			_ = m.pubsub.SendToInstance(ctx, inst.ID, "shard_config", map[string]interface{}{
 				"shard_ids":   []int{},
@@ -694,24 +691,24 @@ func (m *Manager) monitorLoop(ctx context.Context) {
 				continue
 			}
 
-			removed, err := m.reapDeadInstances(ctx)
-			if err != nil {
-				slog.Error("monitor reap error", "err", err)
-				continue
-			}
+// removed, err := m.reapDeadInstances(ctx)
+		// if err != nil {
+		// 	slog.Error("monitor reap error", "err", err)
+		// 	continue
+		// }
 
-			m.mu.Lock()
-			distributed := m.shardsDistributed
-			startupWindow := time.Since(m.startTime) < 300*time.Second
-			m.mu.Unlock()
+		// m.mu.Lock()
+		// distributed := m.shardsDistributed
+		// startupWindow := time.Since(m.startTime) < 300*time.Second
+		// m.mu.Unlock()
 
-			if len(removed) > 0 && distributed && !startupWindow {
-				m.wg.Add(1)
-				go func() {
-					defer m.wg.Done()
-					m.tryRecovery(ctx, removed)
-				}()
-			}
+			// if len(removed) > 0 && distributed && !startupWindow {
+			// 	m.wg.Add(1)
+			// 	go func() {
+			// 		defer m.wg.Done()
+			// 		m.tryRecovery(ctx, removed)
+			// 	}()
+			// }
 
 			guildCounter++
 			if guildCounter >= 6 {
@@ -797,63 +794,63 @@ func (m *Manager) reapDeadInstances(ctx context.Context) ([]*types.InstanceInfo,
 	return removed, nil
 }
 
-func (m *Manager) tryRecovery(ctx context.Context, dead []*types.InstanceInfo) {
-	var orphaned []int
-	for _, inst := range dead {
-		orphaned = append(orphaned, inst.ShardIDs...)
-	}
-	if len(orphaned) == 0 {
-		return
-	}
-
-	alive, err := m.registry.ListAll(ctx)
-	if err != nil || len(alive) == 0 {
-		slog.Error("no alive instances for shard recovery")
-		return
-	}
-
-	deadIDs := make([]string, len(dead))
-	for i, d := range dead {
-		deadIDs[i] = d.ID
-	}
-	slog.Info("recovering orphaned shards", "shards", orphaned, "alive", len(alive))
-	go m.webhook.ShardRecovery(ctx, deadIDs, orphaned, len(alive))
-
-	target := alive[0]
-	for _, inst := range alive[1:] {
-		if len(inst.ShardIDs) < len(target.ShardIDs) {
-			target = inst
-		}
-	}
-
-	m.mu.Lock()
-	for _, sid := range orphaned {
-		m.shardMap[sid] = target.ID
-	}
-	m.mu.Unlock()
-
-	newSet := make(map[int]struct{}, len(target.ShardIDs)+len(orphaned))
-	for _, s := range target.ShardIDs {
-		newSet[s] = struct{}{}
-	}
-	for _, s := range orphaned {
-		newSet[s] = struct{}{}
-	}
-	merged := make([]int, 0, len(newSet))
-	for s := range newSet {
-		merged = append(merged, s)
-	}
-	sort.Ints(merged)
-	target.ShardIDs = merged
-	_ = m.registry.Register(ctx, target.ID, target)
-
-	sort.Ints(orphaned)
-	_ = m.pubsub.SendToInstance(ctx, target.ID, "add_shards", map[string]interface{}{
-		"shard_ids":   orphaned,
-		"shard_count": m.cfg.TotalShards,
-	})
-	slog.Info("assigned recovery shards", "shards", orphaned, "instance", target.ID)
-}
+// func (m *Manager) tryRecovery(ctx context.Context, dead []*types.InstanceInfo) {
+// 	var orphaned []int
+// 	for _, inst := range dead {
+// 		orphaned = append(orphaned, inst.ShardIDs...)
+// 	}
+// 	if len(orphaned) == 0 {
+// 		return
+// 	}
+// 
+// 	alive, err := m.registry.ListAll(ctx)
+// 	if err != nil || len(alive) == 0 {
+// 		slog.Error("no alive instances for shard recovery")
+// 		return
+// 	}
+// 
+// 	deadIDs := make([]string, len(dead))
+// 	for i, d := range dead {
+// 		deadIDs[i] = d.ID
+// 	}
+// 	slog.Info("recovering orphaned shards", "shards", orphaned, "alive", len(alive))
+// 	go m.webhook.ShardRecovery(ctx, deadIDs, orphaned, len(alive))
+// 
+// 	target := alive[0]
+// 	for _, inst := range alive[1:] {
+// 		if len(inst.ShardIDs) < len(target.ShardIDs) {
+// 			target = inst
+// 		}
+// 	}
+// 
+// 	m.mu.Lock()
+// 	for _, sid := range orphaned {
+// 		m.shardMap[sid] = target.ID
+// 	}
+// 	m.mu.Unlock()
+// 
+// 	newSet := make(map[int]struct{}, len(target.ShardIDs)+len(orphaned))
+// 	for _, s := range target.ShardIDs {
+// 		newSet[s] = struct{}{}
+// 	}
+// 	for _, s := range orphaned {
+// 		newSet[s] = struct{}{}
+// 	}
+// 	merged := make([]int, 0, len(newSet))
+// 	for s := range newSet {
+// 		merged = append(merged, s)
+// 	}
+// 	sort.Ints(merged)
+// 	target.ShardIDs = merged
+// 	_ = m.registry.Register(ctx, target.ID, target)
+// 
+// 	sort.Ints(orphaned)
+// 	_ = m.pubsub.SendToInstance(ctx, target.ID, "add_shards", map[string]interface{}{
+// 		"shard_ids":   orphaned,
+// 		"shard_count": m.cfg.TotalShards,
+// 	})
+// 	slog.Info("assigned recovery shards", "shards", orphaned, "instance", target.ID)
+// }
 
 
 func (m *Manager) shardForGuild(guildID int64) int {

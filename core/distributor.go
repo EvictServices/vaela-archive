@@ -48,7 +48,7 @@ func (d *distributor) distribute(instanceCount int) []types.ShardConfig {
 			count++
 		}
 		ids := make([]int, count)
-		for j := range count {
+		for j := 0; j < count; j++ {
 			ids[j] = current + j
 		}
 		configs = append(configs, types.ShardConfig{
